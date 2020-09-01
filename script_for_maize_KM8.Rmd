@@ -1,0 +1,617 @@
+---
+title: "Murphy et al - maize diterpenoid microbiome R scripts"
+output: html_notebook
+---
+
+## Install and Load Libraries
+```{r}
+library(DESeq2)
+library(biobroom)
+library(tidyMB)
+library(vegan)
+library(tidyverse)
+
+
+```
+
+## Load in the data
+You will have to change the paths to the get to where your files are.
+```{r}
+getwd()
+otu_table <- read_tsv("/Users/zerbe/Desktop/maizemicrobiome-master/otu_table_txt.txt") %>% mutate(OTUID = as.character(OTUID))
+maize_map <- read_csv("/Users/zerbe/Desktop/maizemicrobiome-master/maize_sample_map2.csv")
+organelle <- read_rds("/Users/zerbe/Desktop/maizemicrobiome-master/organelle.rds")
+otu_tax <- read_rds("/Users/zerbe/Desktop/maizemicrobiome-master/gg_otus_tax.rds")
+
+head(otu_table)
+```
+
+## Get Data in "tidy" format and remove organelle OTUs
+```{r}
+#how many OTUs are there before filtering
+nrow(otu_table)
+
+#filter the data by organelle and low abundance
+maize_data <- otu_table[!otu_table$OTUID%in%organelle, -ncol(otu_table)] %>% 
+  gather(SampleID, value, -OTUID) %>% 
+  mutate(OTUID = as.character(OTUID)) %>% 
+  inner_join(maize_map) %>% 
+  group_by(OTUID) %>% 
+  filter(sum(value > 0) / n() >= 0.05) %>% 
+  group_by(SampleID) %>% 
+  mutate(depth = sum(value), RA = (value / depth) * 10000, logRA = log2(RA + 1))
+
+otu_table_noorganelle <- otu_table[!otu_table$OTUID%in%organelle, -ncol(otu_table)] 
+nrow(otu_table_noorganelle)
+
+
+#how many were filtered out as organelle 
+otu_table_organelle <- otu_table[otu_table$OTUID%in%organelle, -ncol(otu_table)] 
+nrow(otu_table_organelle)
+```
+
+## Respreading the table
+It is filling the table with the RA values, but if you wanted the original counts, you should replace 'RA' with 'value' in the dplyr::select call as well as the spread() call.
+```{r}
+maize_spread_table <- maize_data %>% 
+  dplyr::select(OTUID, SampleID, RA) %>% 
+  spread(OTUID, RA, fill = 0) %>% 
+  as.data.frame()
+
+rownames(maize_spread_table) <- maize_spread_table$SampleID
+maize_spread_table$SampleID <- NULL
+
+#return number of OTUs after filtering process
+ncol(maize_spread_table)
+```
+
+##plot phyla
+
+```{r}
+maize_data_phyla <- maize_data %>% 
+  inner_join(otu_tax %>% dplyr::rename(OTUID = variable))
+
+maize_data_phyla$Genotype <- factor(maize_data_phyla$Genotype,levels = c("WT", "AN2", "BulkSoil"))
+maize_data_phyla2 <- maize_data_phyla
+
+maize_data_phyla2$Phylum2 <- as.character(maize_data_phyla2$Phylum2)
+
+maize_data_phyla2 <- maize_data_phyla2 %>% 
+  mutate(Phylum3 = case_when(
+           Phylum2 == "Actinobacteria" ~ "Actinobacteria",
+           Phylum2 == "Alphaproteobacteria" ~ "Alphaproteobacteria",
+           Phylum2 == "Acidobacteria" ~ "Acidobacteria",
+           Phylum2 == "Bacteroidetes" ~ "Bacteroidetes",
+           Phylum2 == "Betaproteobacteria" ~ "Betaproteobacteria",
+           Phylum2 == "Deltaproteobacteria" ~ "Deltaproteobacteria",
+           Phylum2 == "Gemmatimonadetes" ~ "Gemmatimonadetes",
+           Phylum2 == "Chloroflexi" ~ "Chloroflexi",
+           Phylum2 == "Verrucomicrobia" ~ "Verrucomicrobia",
+           Phylum2 == "Gammaproteobacteria" ~ "Gammaproteobacteria",
+           TRUE ~ "Other"))
+
+summary(maize_data_phyla2)
+
+phly_plot <- maize_data_phyla2 %>% 
+  group_by(Phylum3) %>% 
+  summarise(total = sum(RA)) %>% 
+  arrange(-total) %>% 
+  #head(11) %>% 
+  inner_join(maize_data_phyla2, by = "Phylum3") %>% 
+  group_by(PotNumber, Compartment, Genotype, Phylum3) %>% 
+  summarise(total = sum(RA/100)) %>%
+  group_by(Compartment, Genotype, Phylum3) %>% 
+  summarise(new = mean(total)) %>% 
+  #filter(Genotype != "BulkSoil") %>% 
+  ggplot(., aes(x = Genotype, y = new, fill = Phylum3)) +
+  geom_bar(stat = "identity") +
+  labs (y = "Relative Abundance") +
+  facet_grid(Compartment ~ Genotype, scales = "free") +
+  scale_fill_brewer(palette = "Spectral") +
+  theme_minimal() +
+  theme(text = element_text(size = 10, family = "Arial"), axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "bottom", legend.title = element_blank())
+
+phly_plot
+
+ggsave(filename = "phlya.png", path = NULL,
+       scale = 1, width = 6.69, height = 5, units = c("in"), dpi = 5000)
+
+```
+
+##alpha diversity
+```{r}
+maize_map2 <- na.omit(maize_map)
+maize_map3 <- arrange(maize_map2,SampleID) 
+
+maize_map3 <- maize_map3 %>% 
+  mutate(Compartment = case_when(
+           Genotype == "BulkSoil" ~ "BulkSoil",
+           TRUE ~ as.character(Compartment)))
+
+alphadiv <- data.frame(cbind(maize_map3, Shannon = diversity((maize_spread_table)))) %>%
+  mutate(depth = rowSums(maize_spread_table))
+
+summary(aov(exp(Shannon) ~ Genotype * Compartment + log2(depth), data = alphadiv)) #order matters!
+summary(aov(exp(Shannon) ~ Genotype * Compartment + log2(depth), data = subset(alphadiv, Compartment != "BulkSoil"))) #order matters!
+summary(aov(exp(Shannon) ~ Genotype + log2(depth), data = subset(alphadiv, Compartment == "Endosphere")))
+summary(aov(exp(Shannon) ~ Genotype + log2(depth), data = subset(alphadiv, Compartment == "Rhizosphere", Genotype != "BulkSoil")))
+
+
+#plot alpha diversity
+
+alphadiv_rhizo <- alphadiv %>% 
+  filter(Compartment != "Endosphere")
+
+alphadiv$Genotype = factor(alphadiv$Genotype, levels=c('WT','AN2','BulkSoil'))
+
+
+alphadiv_plot <- ggplot(alphadiv, aes(x = "", y = exp(Shannon), fill = Genotype)) +
+  geom_boxplot(width = 1) +
+  #scale_fill_manual(values = comp.cols) +
+  facet_grid(. ~ Compartment) +
+  theme_bw() +
+  labs(x = "", y = "Effective Species", fill = "Genotype") +
+  scale_fill_discrete(labels=c("AN2", "WT")) +
+  theme(text = element_text(size = 10, family = "Arial"), axis.ticks.x = element_blank(), legend.key = element_blank()) +
+  theme(legend.title=element_blank()) +
+  #scale_fill_brewer(palette="Paired") +
+    scale_fill_manual(values=c( "#619CFF", "#F8766D", "#00BA38"))
+  theme(legend.justification=c(1,0), legend.position=c(1,0))
+alphadiv_plot
+
+
+ggsave(filename = "alphadiv_plot.png", path = NULL,
+       scale = 1, width = 6.69, height = 4, units = c("in"), dpi = 5000)
+```
+
+
+## PCoA
+```{r}
+
+pc_all <- tidy_pcoa(maize_data %>% 
+                  ungroup() %>% 
+                  select(SampleID, OTUID, logRA, Genotype, Compartment), samples = "SampleID", otus = "OTUID", value = "logRA")
+
+eigen_all <- pc_all$eigen_vals
+eigen_all <- round(eigen_all, digits=2)
+
+plot_pcoa_all <- ggplot(pc_all$axes, aes(MDS1, MDS2, color = Genotype, shape = Compartment), alpha=0.8) +
+  geom_point(size=2)+
+  xlab(paste("PCo1 (", eigen_all[1]*100, " %)", sep = "")) +
+  ylab(paste("PCo2 (", eigen_all[2]*100, " %)", sep = "")) + 
+  theme_bw() +
+  scale_color_manual(values=c("#F8766D", "#00BA38", "#619CFF")) + 
+  theme(text = element_text(size = 11), legend.position = "bottom", legend.box = "verticle")
+plot_pcoa_all
+
+ggsave(filename = "pcoa_all.jpg", path = NULL,
+       scale = 1, width = 3.35, height = 3.0, units = c("in"))
+
+#endosphere only
+pc_endo <- tidy_pcoa(maize_data %>% 
+                  ungroup() %>% 
+                  filter(Compartment == "Endosphere")%>% 
+                  filter(Genotype != "BulkSoil")%>% 
+                  select(SampleID, OTUID, logRA, Genotype, Compartment),samples = "SampleID", otus = "OTUID", value = "logRA")
+
+eigen_endo <- pc_endo$eigen_vals
+eigen_endo <- round(eigen_endo, digits=2)
+
+plot_pcoa_endo <- ggplot(pc_endo$axes, 
+  aes(MDS1, MDS2, color = Genotype), alpha=0.8) +
+  geom_point(size = 2) +
+  xlab(paste("PCo1 (", eigen_endo[1]*100, " %)", sep = "")) +
+  ylab(paste("PCo2 (", eigen_endo[2]*100, " %)", sep = "")) + 
+  theme_bw() +
+  scale_color_manual(values=c("#F8766D", "#619CFF")) + 
+  theme(text = element_text(size = 11), legend.position = "bottom", legend.box = "verticle") +
+  guides(colour = guide_legend(title.position = "top", title.hjust = 0.5), shape = guide_legend(title.position = "top", title.hjust = 0.5)) 
+plot_pcoa_endo
+ggsave(filename = "pcoa_endo.jpg", path = NULL,
+       scale = 1, width = 3.35, height = 3.35, units = c("in"))
+
+#rhizosphere only
+pc_rhizo <- tidy_pcoa(maize_data %>% 
+                  ungroup() %>% 
+                  filter(Compartment == "Rhizosphere")%>% 
+                  filter(Genotype != "BulkSoil")%>% 
+                  select(SampleID, OTUID, logRA, Genotype, Compartment),samples = "SampleID", otus = "OTUID", value = "logRA")
+
+eigen <- pc_rhizo$eigen_vals
+eigen<- round(eigen, digits=2)
+
+plot_pcoa_rhizo <- ggplot(pc_rhizo$axes, 
+  aes(MDS1, MDS2, color = Genotype), alpha=0.8) +
+  geom_point(size = 2) +
+  xlab(paste("PCo1 (", eigen[1]*100, " %)", sep = "")) +
+  ylab(paste("PCo2 (", eigen[2]*100, " %)", sep = "")) + 
+  theme_bw() +
+  scale_color_manual(values=c("#F8766D", "#619CFF")) + 
+  theme(text = element_text(size = 11), legend.position = "bottom", legend.box = "verticle") 
+plot_pcoa_rhizo 
+ggsave(filename = "pcoa_rhizo.jpg", path = NULL,
+       scale = 1, width = 3.35, height = 3.35, units = c("in"))
+```
+
+## Permanova: For everything.
+
+Filter out bulk soil because it is listed as a genotype! 
+```{r}
+tidyMB::long_adonis(maize_data %>% 
+                      filter(Genotype != "BulkSoil") %>% 
+                  ungroup() %>% 
+                  select(SampleID, OTUID, logRA, Genotype, Compartment),samples = "SampleID", otus = "OTUID", value = "logRA", formula = "Compartment*Genotype") %>% tidy()
+```
+
+##Permanova: For each compartment separately
+```{r}
+
+maize_data %>% 
+  filter(Genotype != "BulkSoil") %>% 
+  ungroup() %>% 
+  select(SampleID, OTUID, logRA, Genotype, Water, Compartment) %>% 
+  group_by(Compartment) %>% nest_legacy() %>% 
+  mutate(perm = map(data, ~long_adonis(., otus = "OTUID", value = "logRA", formula = "Genotype"))) %>% 
+  unnest_legacy(map(perm, ~tidy(.)))
+
+```
+
+## OTUs significant as a function of compartment
+```{r}
+maize_deseq_compartments <- maize_data %>% 
+  mutate(Compartment = ifelse(Genotype == "BulkSoil", "BulkSoil", Compartment)) %>% 
+  ungroup() %>% 
+  group_by(OTUID) %>% 
+  filter(sum(value > 0) / n() > 0.1) %>% 
+  ungroup() %>% 
+  dplyr::select(SampleID, Compartment, OTUID, value, Genotype) %>% 
+  group_by(group_var = "DESeq2") %>% 
+  nest_legacy() %>% 
+  mutate(DGEL = map(data, ~suppressMessages(tidyDGEL(., value = "value", method = "DESeq2", formula = "~ Compartment", otus = "OTUID", samples = "SampleID")))) %>% 
+  mutate(dds = map(DGEL, ~suppressMessages(DESeq(.))))
+
+compartments_results <- bind_rows(
+  lfcShrink(maize_deseq_compartments$dds[[1]], contrast = c("Compartment", "BulkSoil", "Endosphere")) %>% tidy() %>% mutate(contrast = "BSvsEndo"),
+  lfcShrink(maize_deseq_compartments$dds[[1]], contrast = c("Compartment", "BulkSoil", "Rhizosphere")) %>% tidy() %>% mutate(contrast = "BSvsRhizo"),
+  lfcShrink(maize_deseq_compartments$dds[[1]], contrast = c("Compartment", "Rhizosphere", "Endosphere")) %>% tidy() %>% mutate(contrast = "RhizovsEndo")
+)
+
+#list of significant
+comp_results_list <-  compartments_results %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  inner_join(otu_tax %>% dplyr::rename(gene =variable)) 
+
+#list of null results (not significant)
+comp_results_list_null <-  compartments_results %>% 
+  filter(p.adjusted >= 0.05) %>% 
+  inner_join(otu_tax %>% dplyr::rename(gene =variable)) 
+
+#lists of significant
+BSvsEndo <-  comp_results_list %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  filter(contrast == "BSvsEndo")
+
+BSvsRhizo <-  comp_results_list %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  filter(contrast == "BSvsRhizo")
+
+RhizovsEndo <-  comp_results_list %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  filter(contrast == "RhizovsEndo")
+
+#phyla that significant OTUs are in
+comp_phyla <- RhizovsEndo %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  mutate(direction = ifelse(estimate > 0, "Rhizosphere", "Endosphere")) %>% 
+  inner_join(otu_tax %>% dplyr::rename(gene = variable)) %>% 
+  dplyr::count(direction, Phylum2) %>% arrange(-n)
+
+#total phyla
+comp_all_phyla <- compartments_results %>% 
+  inner_join(otu_tax %>% dplyr::rename(gene = variable)) %>% 
+  dplyr::count(Phylum2) %>% arrange(-n)
+
+nrow(comp_all_phyla)
+
+```
+
+
+## significantly different between sample types by genotype in the rhizosphere
+```{r}
+maize_deseq_genotypes <- maize_data %>% 
+  mutate(Compartment = ifelse(Genotype == "BulkSoil", "BulkSoil", Compartment)) %>% 
+  filter(Compartment == "Rhizosphere") %>% 
+  ungroup() %>% 
+  group_by(OTUID) %>% 
+  filter(sum(value > 0) / n() > 0.1) %>% 
+  ungroup() %>% 
+  dplyr::select(SampleID, Compartment, OTUID, value, Genotype, Description) %>% 
+  group_by(Compartment) %>% 
+  nest_legacy() %>% 
+  mutate(DGEL = map(data, ~suppressMessages(tidyDGEL(., value = "value", method = "DESeq2", formula = "~ Genotype", otus = "OTUID", samples = "SampleID")))) %>% 
+   mutate(dds = map(DGEL, ~suppressMessages(DESeq(.)))) %>% 
+  mutate(results = map(dds, ~lfcShrink(., contrast = c("Genotype", "AN2", "WT"))))
+
+
+installed.packages()
+
+maize_deseq_genotypes_results <- maize_deseq_genotypes %>% 
+  select(Compartment, results) %>% 
+  unnest_legacy(map(results, ~tidy(.))) %>% 
+  dplyr::rename(OTUID = gene)
+
+maize_deseq_genotypes_results_list <- maize_deseq_genotypes_results %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  inner_join(otu_tax %>% dplyr::rename(OTUID =variable)) 
+
+maize_deseq_genotypes_results_null <- maize_deseq_genotypes_results  %>% 
+  filter(p.adjusted >= 0.05) %>% 
+  inner_join(otu_tax %>% dplyr::rename(OTUID =variable)) 
+
+maize_deseq_genotypes_results %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  mutate(direction = ifelse(estimate > 0, "WT", "AN2")) %>% 
+  inner_join(otu_tax %>% dplyr::rename(OTUID = variable)) %>% 
+  dplyr::count(direction, Phylum2) %>% arrange(-n)
+
+#enriched in WT
+C <-  maize_deseq_genotypes_results_list %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  filter(estimate > 0)
+
+#encriched in AN2
+D <-  maize_deseq_genotypes_results_list %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  filter(estimate < 0)
+
+M2 <- maize_deseq_genotypes_results_null
+M2 <- M2[!duplicated(M2$OTUID),]
+nrow(M2)
+
+```
+
+##boxplots of significant OTUs in the rhizosphere
+
+```{r}
+C$Genotype <- rep("AN2",nrow(C))
+D$Genotype <- rep("WT",nrow(D))
+
+#-------------------
+data_for_heatC <- C %>% 
+  inner_join(maize_data, by = c("OTUID")) %>% 
+  filter(Compartment.y == "Rhizosphere" ) %>% 
+  filter(Genotype.y != "BulkSoil" ) %>% 
+  group_by(OTUID) %>% 
+  mutate(scaled_value = (value-min(value))/(max(value)-min(value)))
+
+plot_C <- ggplot(subset(data_for_heatC), aes(x = Genotype.y, y = value)) +
+  geom_boxplot() +
+  facet_wrap( ~ OTUID, scales = "free", ncol = 6) +
+  theme_bw() +
+  labs(x = "", y = "value") +
+  theme(text = element_text(size = 11), axis.ticks.x = element_blank(), legend.key = element_blank()) + 
+  scale_fill_brewer(palette="Paired") +
+  theme(legend.title=element_blank()) +
+  theme(legend.justification=c(1,0), legend.position = "bottom")
+plot_C
+
+ggsave(filename = "geno_WT.jpg", path = NULL,
+       scale = 1, width = 6.69, height = 5, units = c("in"))
+
+#-------------------
+data_for_heatD <- D %>% 
+  inner_join(maize_data, by = c("OTUID")) %>% 
+  filter(Compartment.y == "Rhizosphere" ) %>% 
+  filter(Genotype.y != "BulkSoil" ) %>% 
+  group_by(OTUID) %>% 
+  mutate(scaled_value = (value-min(value))/(max(value)-min(value)))
+
+plot_D <- ggplot(subset(data_for_heatD), aes(x = Genotype.y, y = value)) +
+  geom_boxplot() +
+  facet_wrap( ~ OTUID, scales = "free", ncol = 6) +
+  theme_bw() +
+  labs(x = "", y = "value") +
+  theme(text = element_text(size = 11), axis.ticks.x = element_blank(), legend.key = element_blank()) + 
+  scale_fill_brewer(palette="Paired") +
+  theme(legend.title=element_blank()) +
+  theme(legend.justification=c(1,0), legend.position = "bottom")
+plot_D
+
+ggsave(filename = "geno_AN2.jpg", path = NULL,
+       scale = 1, width = 3.35, height = 5, units = c("in"))
+
+#------------------
+
+```
+
+
+
+## significantly different between sample types by genotype in the endosphere
+
+```{r}
+maize_deseq_genotypes_E <- maize_data %>% 
+  mutate(Compartment = ifelse(Genotype == "BulkSoil", "BulkSoil", Compartment)) %>% 
+  filter(Compartment == "Endosphere") %>% 
+  ungroup() %>% 
+  group_by(OTUID) %>% 
+  filter(sum(value > 0) / n() > 0.1) %>% 
+  ungroup() %>% 
+  dplyr::select(SampleID, Compartment, OTUID, value, Genotype, Description) %>% 
+  group_by(Compartment) %>% 
+  nest_legacy() %>% 
+  mutate(DGEL = map(data, ~suppressMessages(tidyDGEL(., value = "value", method = "DESeq2", formula = "~ Genotype", otus = "OTUID", samples = "SampleID")))) %>% 
+   mutate(dds = map(DGEL, ~suppressMessages(DESeq(.)))) %>% 
+  mutate(results = map(dds, ~lfcShrink(., contrast = c("Genotype", "WT", "AN2"))))
+
+maize_deseq_genotypes_results_E <- maize_deseq_genotypes_E %>% 
+  select(Compartment, results) %>% 
+  unnest_legacy(map(results, ~tidy(.))) %>% 
+  dplyr::rename(OTUID = gene)
+
+maize_deseq_genotypes_results_list_E <- maize_deseq_genotypes_results_E %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  inner_join(otu_tax %>% dplyr::rename(OTUID =variable)) 
+
+maize_deseq_genotypes_results_null_E <- maize_deseq_genotypes_results_E  %>% 
+  filter(p.adjusted >= 0.05) %>% 
+  inner_join(otu_tax %>% dplyr::rename(OTUID =variable)) 
+
+maize_deseq_genotypes_results_E %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  mutate(direction = ifelse(estimate > 0, "WT", "AN2")) %>% 
+  inner_join(otu_tax %>% dplyr::rename(OTUID = variable)) %>% 
+  dplyr::count(direction, Phylum2) %>% arrange(-n)
+
+C_E <-  maize_deseq_genotypes_results_list_E %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  filter(estimate > 0)
+
+D_E <-  maize_deseq_genotypes_results_list_E %>% 
+  filter(p.adjusted <= 0.05) %>% 
+  filter(estimate < 0)
+
+M2_E <- maize_deseq_genotypes_results_null_E
+M2_E <- M2_E[!duplicated(M2_E$OTUID),]
+nrow(M2_E)
+
+```
+
+
+Rarefaction 
+```{r}
+##Load in count data, remove the taxonomy part, and convert OTUID to character (instead of integer)
+mo <- read_tsv("/Users/zerbe/Desktop/maizemicrobiome-master/otu_table_txt.txt") %>%
+  mutate(OTUID = as.character(OTUID)) %>%
+  dplyr::select(-taxonomy) %>% as.data.frame()
+
+## Load in taxonomy
+motax <- read_tsv("/Users/zerbe/Desktop/maizemicrobiome-master/otu_table_txt.txt") %>%
+  select(OTUID, taxonomy) %>%
+  mutate(OTUID = as.character(OTUID))
+
+## Convert rownames to be OTUID and remove OTUID from the dataframe
+rownames(mo) <- mo$OTUID
+mo$OTUID <- NULL
+
+## get organellar OTUs
+org <- motax %>% filter(grepl("chlorop|mitoch", taxonomy, ignore.case = T))
+
+## filter otu dataframe for organelles and remove lowly prevalent otus
+prev <- function(x){
+  return(length(x[x > 0]) / length(x))
+}
+mo <- mo[!rownames(mo)%in%org$OTUID,]
+mo <- mo[apply(mo, 1, prev) > 0.1,]
+
+## rarefy the data to the sample with the lowest sequencing depth
+mo_rare <- vegan::rrarefy(t(mo), sample = min(colSums(mo)))
+
+## Read in sample data
+sd <- read_csv("/Users/zerbe/Desktop/maizemicrobiome-master/maize_sample_map2.csv")
+
+## match count table order to that of sample data
+mo_rare <- mo_rare[match(sd$SampleID, rownames(mo_rare)),]
+
+## Do the permanova
+rs <- sd %>% filter(Genotype != "BulkSoil" & Compartment == "Rhizosphere")
+mo_rare_rs <- mo_rare[rownames(mo_rare)%in%rs$SampleID,]
+vegan::adonis(mo_rare_rs ~ Genotype, rs)
+
+## Do the permanova
+rs <- sd %>% filter(Genotype != "BulkSoil" & Compartment == "Endosphere")
+mo_rare_rs <- mo_rare[rownames(mo_rare)%in%rs$SampleID,]
+vegan::adonis(mo_rare_rs ~ Genotype, rs)
+
+## Do the permanova
+rs <- sd %>% filter(Genotype != "BulkSoil")
+mo_rare_rs <- mo_rare[rownames(mo_rare)%in%rs$SampleID,]
+vegan::adonis(mo_rare_rs ~ Genotype*Compartment, rs)
+
+
+alphadiv <- data.frame(cbind(maize_map3, Shannon = diversity((mo_rare)))) %>%
+  mutate(depth = rowSums(mo_rare))
+
+summary(aov(exp(Shannon) ~ Genotype * Compartment + log2(depth), data = alphadiv)) #order matters!
+summary(aov(exp(Shannon) ~ Genotype * Compartment + log2(depth), data = subset(alphadiv, Compartment != "BulkSoil"))) #order matters!
+summary(aov(exp(Shannon) ~ Genotype + log2(depth), data = subset(alphadiv, Compartment == "Endosphere")))
+summary(aov(exp(Shannon) ~ Genotype + log2(depth), data = subset(alphadiv, Compartment == "Rhizosphere", Genotype != "BulkSoil")))
+```
+
+## PCoA rarefaction
+```{r}
+
+mo_rare_pca <- as.data.frame(t(mo_rare))
+setDT(mo_rare_pca, keep.rownames = TRUE)[]
+names(mo_rare_pca)[1] <- "OTUID"
+mo_rare_pca <- mo_rare_pca %>% 
+  gather(SampleID, value, -OTUID) %>% 
+  mutate(OTUID = as.character(OTUID)) %>% 
+  inner_join(maize_map) %>% 
+  group_by(OTUID) %>% 
+  group_by(SampleID) 
+
+
+pc_all <- tidy_pcoa(mo_rare_pca %>% 
+                  ungroup() %>% 
+                  select(SampleID, OTUID, value, Genotype, Compartment), samples = "SampleID", otus = "OTUID", value = "value")
+
+eigen_all <- pc_all$eigen_vals
+eigen_all <- round(eigen_all, digits=2)
+
+plot_pcoa_all <- ggplot(pc_all$axes, aes(MDS1, MDS2, color = Genotype, shape = Compartment), alpha=0.8) +
+  geom_point(size=2)+
+  xlab(paste("PCo1 (", eigen_all[1]*100, " %)", sep = "")) +
+  ylab(paste("PCo2 (", eigen_all[2]*100, " %)", sep = "")) + 
+  theme_bw() +
+  scale_color_manual(values=c("#F8766D", "#00BA38", "#619CFF")) + 
+  theme(text = element_text(size = 11), legend.position = "bottom", legend.box = "verticle")
+plot_pcoa_all
+
+ggsave(filename = "pcoa_all_rare.jpg", path = NULL,
+       scale = 1, width = 3.35, height = 3.0, units = c("in"))
+
+#endosphere only
+pc_endo <- tidy_pcoa(maize_data %>% 
+                  ungroup() %>% 
+                  filter(Compartment == "Endosphere")%>% 
+                  filter(Genotype != "BulkSoil")%>% 
+                  select(SampleID, OTUID, logRA, Genotype, Compartment),samples = "SampleID", otus = "OTUID", value = "logRA")
+
+eigen_endo <- pc_endo$eigen_vals
+eigen_endo <- round(eigen_endo, digits=2)
+
+plot_pcoa_endo <- ggplot(pc_endo$axes, 
+  aes(MDS1, MDS2, color = Genotype), alpha=0.8) +
+  geom_point(size = 2) +
+  xlab(paste("PCo1 (", eigen_endo[1]*100, " %)", sep = "")) +
+  ylab(paste("PCo2 (", eigen_endo[2]*100, " %)", sep = "")) + 
+  theme_bw() +
+  scale_color_manual(values=c("#F8766D", "#619CFF")) + 
+  theme(text = element_text(size = 11), legend.position = "bottom", legend.box = "verticle") +
+  guides(colour = guide_legend(title.position = "top", title.hjust = 0.5), shape = guide_legend(title.position = "top", title.hjust = 0.5)) 
+plot_pcoa_endo
+ggsave(filename = "pcoa_endo_rare.jpg", path = NULL,
+       scale = 1, width = 3.35, height = 3.35, units = c("in"))
+
+#rhizosphere only
+pc_rhizo <- tidy_pcoa(maize_data %>% 
+                  ungroup() %>% 
+                  filter(Compartment == "Rhizosphere")%>% 
+                  filter(Genotype != "BulkSoil")%>% 
+                  select(SampleID, OTUID, logRA, Genotype, Compartment),samples = "SampleID", otus = "OTUID", value = "logRA")
+
+eigen <- pc_rhizo$eigen_vals
+eigen<- round(eigen, digits=2)
+
+plot_pcoa_rhizo <- ggplot(pc_rhizo$axes, 
+  aes(MDS1, MDS2, color = Genotype), alpha=0.8) +
+  geom_point(size = 2) +
+  xlab(paste("PCo1 (", eigen[1]*100, " %)", sep = "")) +
+  ylab(paste("PCo2 (", eigen[2]*100, " %)", sep = "")) + 
+  theme_bw() +
+  scale_color_manual(values=c("#F8766D", "#619CFF")) + 
+  theme(text = element_text(size = 11), legend.position = "bottom", legend.box = "verticle") 
+plot_pcoa_rhizo 
+ggsave(filename = "pcoa_rhizo_rare.jpg", path = NULL,
+       scale = 1, width = 3.35, height = 3.35, units = c("in"))
+```
